@@ -16,6 +16,10 @@ package starling.core
     import flash.display.StageAlign;
     import flash.display.StageScaleMode;
     import flash.display3D.Context3D;
+    import flash.display3D.Context3DCompareMode;
+    import flash.display3D.Context3DRenderMode;
+    import flash.display3D.Context3DTriangleFace;
+    import flash.display3D.Program3D;
     import flash.errors.IllegalOperationError;
     import flash.events.ErrorEvent;
     import flash.events.Event;
@@ -31,6 +35,7 @@ package starling.core
     import flash.ui.Mouse;
     import flash.ui.Multitouch;
     import flash.ui.MultitouchInputMode;
+    import flash.utils.ByteArray;
     import flash.utils.Dictionary;
     import flash.utils.getTimer;
     import flash.utils.setTimeout;
@@ -42,9 +47,10 @@ package starling.core
     import starling.events.ResizeEvent;
     import starling.events.TouchPhase;
     import starling.events.TouchProcessor;
-    import starling.rendering.Painter;
-    import starling.utils.Align;
+    import starling.utils.HAlign;
     import starling.utils.SystemUtil;
+    import starling.utils.VAlign;
+    import starling.utils.execute;
 
     /** Dispatched when a new render context is created. The 'data' property references the context. */
     [Event(name="context3DCreate", type="starling.events.Event")]
@@ -101,12 +107,10 @@ package starling.core
      *        AGAL code.</li>
      *    <li>BASELINE_EXTENDED: adds support for textures up to 4096x4096 pixels. This is
      *        especially useful on mobile devices with very high resolutions.</li>
-     *    <li>STANDARD_CONSTRAINED, STANDARD, STANDARD_EXTENDED: each provide more AGAL features,
-     *        among other things. Most Starling games will not gain much from them.</li>
      *  </ul>
      *  
      *  <p>The recommendation is to deploy your app with the profile "auto" (which makes Starling
-     *  pick the best available of those), but test it in all available profiles.</p>
+     *  pick the best available of those three), but test it in all available profiles.</p>
      *  
      *  <strong>Accessing the Starling object</strong>
      * 
@@ -143,14 +147,13 @@ package starling.core
      *  <strong>Handling a lost render context</strong>
      *  
      *  <p>On some operating systems and under certain conditions (e.g. returning from system
-     *  sleep), Starling's stage3D render context may be lost. Starling will try to recover
-     *  from a lost context automatically. To be able to do this, Starling will cache textures
-     *  in RAM to be able to restore them after the context was lost. This will take up quite
-     *  a bit of extra memory, though, which might be problematic especially on mobile platforms.
-     *  To avoid the higher memory footprint, it's recommend to load your textures with
-     *  Starling's "AssetManager"; it is smart enough to recreate a texture directly from its
-     *  origin.</p>
-     *
+     *  sleep), Starling's stage3D render context may be lost. Starling can recover from a lost
+     *  context if the class property "handleLostContext" is set to "true". Keep in mind, however, 
+     *  that this comes at the price of increased memory consumption; Starling will cache textures 
+     *  in RAM to be able to restore them when the context is lost. (Except if you use the
+     *  'AssetManager' for your textures. It is smart enough to recreate a texture directly
+     *  from its origin.)</p> 
+     *  
      *  <p>In case you want to react to a context loss, Starling dispatches an event with
      *  the type "Event.CONTEXT3D_CREATE" when the context is restored. You can recreate any 
      *  invalid resources in a corresponding event listener.</p>
@@ -177,44 +180,50 @@ package starling.core
      *  
      *  <p>The Starling wiki contains a <a href="http://goo.gl/BsXzw">tutorial</a> with more 
      *  information about this topic.</p>
-     *
-     *  @see starling.utils.AssetManager
-     *
+     * 
      */ 
     public class Starling extends EventDispatcher
     {
         /** The version of the Starling framework. */
-        public static const VERSION:String = "2.0";
+        public static const VERSION:String = "1.8";
         
         /** The key for the shader programs stored in 'contextData' */
         private static const PROGRAM_DATA_NAME:String = "Starling.programs"; 
         
         // members
         
-        private var _stage:Stage; // starling.display.stage!
-        private var _rootClass:Class;
-        private var _root:DisplayObject;
-        private var _juggler:Juggler;
-        private var _painter:Painter;
-        private var _touchProcessor:TouchProcessor;
-        private var _antiAliasing:int;
-        private var _frameTimestamp:Number;
-        private var _frameID:uint;
-        private var _leftMouseDown:Boolean;
-        private var _statsDisplay:StatsDisplay;
-        private var _started:Boolean;
-        private var _rendering:Boolean;
-        private var _supportHighResolutions:Boolean;
+        private var mStage3D:Stage3D;
+        private var mStage:Stage; // starling.display.stage!
+        private var mRootClass:Class;
+        private var mRoot:DisplayObject;
+        private var mJuggler:Juggler;
+        private var mSupport:RenderSupport;
+        private var mTouchProcessor:TouchProcessor;
+        private var mAntiAliasing:int;
+        private var mSimulateMultitouch:Boolean;
+        private var mEnableErrorChecking:Boolean;
+        private var mLastFrameTimestamp:Number;
+        private var mLeftMouseDown:Boolean;
+        private var mStatsDisplay:StatsDisplay;
+        private var mShareContext:Boolean;
+        private var mProfile:String;
+        private var mContext:Context3D;
+        private var mStarted:Boolean;
+        private var mRendering:Boolean;
+        private var mSupportHighResolutions:Boolean;
+        private var mBroadcastKeyboardEvents:Boolean;
         
-        private var _viewPort:Rectangle;
-        private var _previousViewPort:Rectangle;
-        private var _clippedViewPort:Rectangle;
+        private var mViewPort:Rectangle;
+        private var mPreviousViewPort:Rectangle;
+        private var mClippedViewPort:Rectangle;
 
-        private var _nativeStage:flash.display.Stage;
-        private var _nativeOverlay:Sprite;
+        private var mNativeStage:flash.display.Stage;
+        private var mNativeOverlay:flash.display.Sprite;
+        private var mNativeStageContentScaleFactor:Number;
 
         private static var sCurrent:Starling;
-        private static var sPainters:Dictionary = new Dictionary(true);
+        private static var sHandleLostContext:Boolean = true;
+        private static var sContextData:Dictionary = new Dictionary(true);
         private static var sAll:Vector.<Starling> = new <Starling>[];
         
         // construction
@@ -245,32 +254,39 @@ package starling.core
          */
         public function Starling(rootClass:Class, stage:flash.display.Stage, 
                                  viewPort:Rectangle=null, stage3D:Stage3D=null,
-                                 renderMode:String="auto", profile:Object="auto")
+                                 renderMode:String="auto", profile:Object="baselineConstrained")
         {
             if (stage == null) throw new ArgumentError("Stage must not be null");
             if (viewPort == null) viewPort = new Rectangle(0, 0, stage.stageWidth, stage.stageHeight);
             if (stage3D == null) stage3D = stage.stage3Ds[0];
 
-            // TODO it might make sense to exchange the 'renderMode' and 'profile' parameters.
-
             SystemUtil.initialize();
             sAll.push(this);
             makeCurrent();
 
-            _rootClass = rootClass;
-            _viewPort = viewPort;
-            _previousViewPort = new Rectangle();
-            _stage = new Stage(viewPort.width, viewPort.height, stage.color);
-            _nativeOverlay = new Sprite();
-            _nativeStage = stage;
-            _nativeStage.addChild(_nativeOverlay);
-            _touchProcessor = new TouchProcessor(_stage);
-            _juggler = new Juggler();
-            _antiAliasing = 0;
-            _supportHighResolutions = false;
-            _frameTimestamp = getTimer() / 1000.0;
-            _painter = createPainter(stage3D);
+            mRootClass = rootClass;
+            mViewPort = viewPort;
+            mPreviousViewPort = new Rectangle();
+            mStage3D = stage3D;
+            mStage = new Stage(viewPort.width, viewPort.height, stage.color);
+            mNativeOverlay = new Sprite();
+            mNativeStage = stage;
+            mNativeStage.addChild(mNativeOverlay);
+            mNativeStageContentScaleFactor = 1.0;
+            mTouchProcessor = new TouchProcessor(mStage);
+            mJuggler = new Juggler();
+            mAntiAliasing = 0;
+            mSimulateMultitouch = false;
+            mEnableErrorChecking = false;
+            mSupportHighResolutions = false;
+            mBroadcastKeyboardEvents = true;
+            mLastFrameTimestamp = getTimer() / 1000.0;
+            mSupport  = new RenderSupport();
             
+            // for context data, we actually reference by stage3D, since it survives a context loss
+            sContextData[stage3D] = new Dictionary();
+            sContextData[stage3D][PROGRAM_DATA_NAME] = new Dictionary();
+
             // all other modes are problematic in Starling, so we force those here
             stage.scaleMode = StageScaleMode.NO_SCALE;
             stage.align = StageAlign.TOP_LEFT;
@@ -286,11 +302,19 @@ package starling.core
             stage.addEventListener(Event.RESIZE, onResize, false, 0, true);
             stage.addEventListener(Event.MOUSE_LEAVE, onMouseLeave, false, 0, true);
             
-            stage3D.addEventListener(Event.CONTEXT3D_CREATE, onContextCreated, false, 10, true);
-            stage3D.addEventListener(ErrorEvent.ERROR, onStage3DError, false, 10, true);
+            mStage3D.addEventListener(Event.CONTEXT3D_CREATE, onContextCreated, false, 10, true);
+            mStage3D.addEventListener(ErrorEvent.ERROR, onStage3DError, false, 10, true);
             
-            if (_painter.shareContext)
+            if (mStage3D.context3D && mStage3D.context3D.driverInfo != "Disposed")
             {
+                if (profile == "auto" || profile is Array)
+                    throw new ArgumentError("When sharing the context3D, " +
+                        "the actual profile has to be supplied");
+                else
+                    mProfile = "profile" in mStage3D.context3D ? mStage3D.context3D["profile"] :
+                                                                 profile as String;
+                
+                mShareContext = true;
                 setTimeout(initialize, 1); // we don't call it right away, because Starling should
                                            // behave the same way with or without a shared context
             }
@@ -300,85 +324,144 @@ package starling.core
                     trace("[Starling] Mask support requires 'depthAndStencil' to be enabled" +
                           " in the application descriptor.");
 
-                _painter.requestContext3D(renderMode, profile);
+                mShareContext = false;
+                requestContext3D(stage3D, renderMode, profile);
             }
         }
-
+        
         /** Disposes all children of the stage and the render context; removes all registered
          *  event listeners. */
         public function dispose():void
         {
             stop(true);
 
-            _nativeStage.removeEventListener(Event.ENTER_FRAME, onEnterFrame, false);
-            _nativeStage.removeEventListener(KeyboardEvent.KEY_DOWN, onKey, false);
-            _nativeStage.removeEventListener(KeyboardEvent.KEY_UP, onKey, false);
-            _nativeStage.removeEventListener(Event.RESIZE, onResize, false);
-            _nativeStage.removeEventListener(Event.MOUSE_LEAVE, onMouseLeave, false);
-            _nativeStage.removeChild(_nativeOverlay);
+            mNativeStage.removeEventListener(Event.ENTER_FRAME, onEnterFrame, false);
+            mNativeStage.removeEventListener(KeyboardEvent.KEY_DOWN, onKey, false);
+            mNativeStage.removeEventListener(KeyboardEvent.KEY_UP, onKey, false);
+            mNativeStage.removeEventListener(Event.RESIZE, onResize, false);
+            mNativeStage.removeEventListener(Event.MOUSE_LEAVE, onMouseLeave, false);
+            mNativeStage.removeChild(mNativeOverlay);
             
-            stage3D.removeEventListener(Event.CONTEXT3D_CREATE, onContextCreated, false);
-            stage3D.removeEventListener(Event.CONTEXT3D_CREATE, onContextRestored, false);
-            stage3D.removeEventListener(ErrorEvent.ERROR, onStage3DError, false);
+            mStage3D.removeEventListener(Event.CONTEXT3D_CREATE, onContextCreated, false);
+            mStage3D.removeEventListener(ErrorEvent.ERROR, onStage3DError, false);
             
             for each (var touchEventType:String in touchEventTypes)
-                _nativeStage.removeEventListener(touchEventType, onTouch, false);
-
-            var index:int =  sAll.indexOf(this);
-            if (index != -1) sAll.removeAt(index);
-
-            var numInstancesSharingThisPainter:int =
-                sAll.filter(function(s:Starling, ...rest):Boolean
-                {
-                    return s.stage3D == stage3D;
-                }).length;
-
-            if (numInstancesSharingThisPainter == 0)
+                mNativeStage.removeEventListener(touchEventType, onTouch, false);
+            
+            if (mStage) mStage.dispose();
+            if (mSupport) mSupport.dispose();
+            if (mTouchProcessor) mTouchProcessor.dispose();
+            if (sCurrent == this) sCurrent = null;
+            if (mContext && !mShareContext) 
             {
-                delete sPainters[stage3D];
-                _painter.dispose();
+                // Per default, the context is recreated as long as there are listeners on it.
+                // Beginning with AIR 3.6, we can avoid that with an additional parameter.
+                execute(mContext.dispose, false);
             }
 
-            if (_touchProcessor) _touchProcessor.dispose();
-            if (_stage) _stage.dispose();
-            if (sCurrent == this) sCurrent = null;
+            var index:int =  sAll.indexOf(this);
+            if (index != -1) sAll.splice(index, 1);
         }
         
         // functions
         
+        private function requestContext3D(stage3D:Stage3D, renderMode:String, profile:Object):void
+        {
+            var profiles:Array;
+            var currentProfile:String;
+            
+            if (profile == "auto")
+                profiles = ["standardExtended", "standard", "standardConstrained", "baselineExtended", "baseline", "baselineConstrained"];
+            else if (profile is String)
+                profiles = [profile as String];
+            else if (profile is Array)
+                profiles = profile as Array;
+            else
+                throw new ArgumentError("Profile must be of type 'String' or 'Array'");
+            
+            mStage3D.addEventListener(Event.CONTEXT3D_CREATE, onCreated, false, 100);
+            mStage3D.addEventListener(ErrorEvent.ERROR, onError, false, 100);
+            
+            requestNextProfile();
+            
+            function requestNextProfile():void
+            {
+                currentProfile = profiles.shift();
+
+                try { execute(mStage3D.requestContext3D, renderMode, currentProfile); }
+                catch (error:Error)
+                {
+                    if (profiles.length != 0) setTimeout(requestNextProfile, 1);
+                    else throw error;
+                }
+            }
+            
+            function onCreated(event:Event):void
+            {
+                var context:Context3D = stage3D.context3D;
+
+                if (renderMode == Context3DRenderMode.AUTO && profiles.length != 0 &&
+                    context.driverInfo.indexOf("Software") != -1)
+                {
+                    onError(event);
+                }
+                else
+                {
+                    mProfile = currentProfile;
+                    onFinished();
+                }
+            }
+            
+            function onError(event:Event):void
+            {
+                if (profiles.length != 0)
+                {
+                    event.stopImmediatePropagation();
+                    setTimeout(requestNextProfile, 1);
+                }
+                else onFinished();
+            }
+            
+            function onFinished():void
+            {
+                mStage3D.removeEventListener(Event.CONTEXT3D_CREATE, onCreated);
+                mStage3D.removeEventListener(ErrorEvent.ERROR, onError);
+            }
+        }
+        
         private function initialize():void
         {
             makeCurrent();
-            updateViewPort(true);
-
-            if (!shareContext) // ideal time: after viewPort setup, before root creation
-                dispatchEventWith(Event.CONTEXT3D_CREATE, false, context);
-
+            
+            initializeGraphicsAPI();
             initializeRoot();
-            _frameTimestamp = getTimer() / 1000.0;
+            
+            mTouchProcessor.simulateMultitouch = mSimulateMultitouch;
+            mLastFrameTimestamp = getTimer() / 1000.0;
+        }
+        
+        private function initializeGraphicsAPI():void
+        {
+            mContext = mStage3D.context3D;
+            mContext.enableErrorChecking = mEnableErrorChecking;
+            contextData[PROGRAM_DATA_NAME] = new Dictionary();
+            
+            trace("[Starling] Initialization complete.");
+            trace("[Starling] Display Driver:", mContext.driverInfo);
+
+            updateViewPort(true);
+            dispatchEventWith(Event.CONTEXT3D_CREATE, false, mContext);
         }
         
         private function initializeRoot():void
         {
-            if (_root == null && _rootClass != null)
+            if (mRoot == null && mRootClass != null)
             {
-                _root = new _rootClass() as DisplayObject;
-                if (_root == null) throw new Error("Invalid root class: " + _rootClass);
-                _stage.addChildAt(_root, 0);
+                mRoot = new mRootClass() as DisplayObject;
+                if (mRoot == null) throw new Error("Invalid root class: " + mRootClass);
+                mStage.addChildAt(mRoot, 0);
 
-                dispatchEventWith(starling.events.Event.ROOT_CREATED, false, _root);
-            }
-        }
-
-        private function createPainter(stage3D:Stage3D):Painter
-        {
-            if (stage3D in sPainters)
-                return sPainters[stage3D];
-            else
-            {
-                var painter:Painter = new Painter(stage3D);
-                sPainters[stage3D] = painter;
-                return painter;
+                dispatchEventWith(starling.events.Event.ROOT_CREATED, false, mRoot);
             }
         }
         
@@ -387,14 +470,14 @@ package starling.core
         public function nextFrame():void
         {
             var now:Number = getTimer() / 1000.0;
-            var passedTime:Number = now - _frameTimestamp;
-            _frameTimestamp = now;
-
+            var passedTime:Number = now - mLastFrameTimestamp;
+            mLastFrameTimestamp = now;
+            
             // to avoid overloading time-based animations, the maximum delta is truncated.
             if (passedTime > 1.0) passedTime = 1.0;
 
             // after about 25 days, 'getTimer()' will roll over. A rare event, but still ...
-            if (passedTime < 0.0) passedTime = 1.0 / _nativeStage.frameRate;
+            if (passedTime < 0.0) passedTime = 1.0 / mNativeStage.frameRate;
 
             advanceTime(passedTime);
             render();
@@ -409,9 +492,9 @@ package starling.core
             
             makeCurrent();
             
-            _touchProcessor.advanceTime(passedTime);
-            _stage.advanceTime(passedTime);
-            _juggler.advanceTime(passedTime);
+            mTouchProcessor.advanceTime(passedTime);
+            mStage.advanceTime(passedTime);
+            mJuggler.advanceTime(passedTime);
         }
         
         /** Renders the complete display list. Before rendering, the context is cleared; afterwards,
@@ -429,31 +512,33 @@ package starling.core
             updateViewPort();
             dispatchEventWith(starling.events.Event.RENDER);
 
-            var shareContext:Boolean = _painter.shareContext;
-            var scaleX:Number = _viewPort.width  / _stage.stageWidth;
-            var scaleY:Number = _viewPort.height / _stage.stageHeight;
+            var scaleX:Number = mViewPort.width  / mStage.stageWidth;
+            var scaleY:Number = mViewPort.height / mStage.stageHeight;
+            
+            mContext.setDepthTest(false, Context3DCompareMode.ALWAYS);
+            mContext.setCulling(Context3DTriangleFace.NONE);
 
-            _painter.nextFrame();
-            _painter.pixelSize = 1.0 / contentScaleFactor;
-            _painter.state.setProjectionMatrix(
-                _viewPort.x < 0 ? -_viewPort.x / scaleX : 0.0,
-                _viewPort.y < 0 ? -_viewPort.y / scaleY : 0.0,
-                _clippedViewPort.width  / scaleX,
-                _clippedViewPort.height / scaleY,
-                _stage.stageWidth, _stage.stageHeight, _stage.cameraPosition);
+            mSupport.nextFrame();
+            mSupport.stencilReferenceValue = 0;
+            mSupport.renderTarget = null; // back buffer
+            mSupport.setProjectionMatrix(
+                mViewPort.x < 0 ? -mViewPort.x / scaleX : 0.0,
+                mViewPort.y < 0 ? -mViewPort.y / scaleY : 0.0,
+                mClippedViewPort.width  / scaleX,
+                mClippedViewPort.height / scaleY,
+                mStage.stageWidth, mStage.stageHeight, mStage.cameraPosition);
             
-            if (!shareContext)
-                _painter.clear(_stage.color, 1.0);
+            if (!mShareContext)
+                RenderSupport.clear(mStage.color, 1.0);
             
-            _stage.render(_painter);
-            _painter.finishFrame();
-            _painter.frameID = ++_frameID;
-
-            if (_statsDisplay)
-                _statsDisplay.drawCount = _painter.drawCount;
+            mStage.render(mSupport, 1.0);
+            mSupport.finishQuadBatch();
             
-            if (!shareContext)
-                _painter.present();
+            if (mStatsDisplay)
+                mStatsDisplay.drawCount = mSupport.drawCount;
+            
+            if (!mShareContext)
+                mContext.present();
         }
         
         private function updateViewPort(forceUpdate:Boolean=false):void
@@ -461,38 +546,63 @@ package starling.core
             // the last set viewport is stored in a variable; that way, people can modify the
             // viewPort directly (without a copy) and we still know if it has changed.
             
-            if (forceUpdate ||
-                _previousViewPort.width  != _viewPort.width  ||
-                _previousViewPort.height != _viewPort.height ||
-                _previousViewPort.x != _viewPort.x ||
-                _previousViewPort.y != _viewPort.y)
+            if (forceUpdate || mPreviousViewPort.width != mViewPort.width || 
+                mPreviousViewPort.height != mViewPort.height ||
+                mPreviousViewPort.x != mViewPort.x || mPreviousViewPort.y != mViewPort.y)
             {
-                _previousViewPort.setTo(_viewPort.x, _viewPort.y, _viewPort.width, _viewPort.height);
+                mPreviousViewPort.setTo(mViewPort.x, mViewPort.y, mViewPort.width, mViewPort.height);
                 
                 // Constrained mode requires that the viewport is within the native stage bounds;
                 // thus, we use a clipped viewport when configuring the back buffer. (In baseline
                 // mode, that's not necessary, but it does not hurt either.)
                 
-                _clippedViewPort = _viewPort.intersection(
-                    new Rectangle(0, 0, _nativeStage.stageWidth, _nativeStage.stageHeight));
+                mClippedViewPort = mViewPort.intersection(
+                    new Rectangle(0, 0, mNativeStage.stageWidth, mNativeStage.stageHeight));
                 
-                if (!shareContext)
+                if (!mShareContext)
                 {
-                    var contentScaleFactor:Number =
-                            _supportHighResolutions ? _nativeStage.contentsScaleFactor : 1.0;
-
-                    _painter.configureBackBuffer(_clippedViewPort, contentScaleFactor,
-                        _antiAliasing, true);
+                    // setting x and y might move the context to invalid bounds (since changing
+                    // the size happens in a separate operation) -- so we have no choice but to
+                    // set the backbuffer to a very small size first, to be on the safe side.
+                    
+                    if (mProfile == "baselineConstrained")
+                        configureBackBuffer(32, 32, mAntiAliasing, true);
+                    
+                    mStage3D.x = mClippedViewPort.x;
+                    mStage3D.y = mClippedViewPort.y;
+                    
+                    configureBackBuffer(mClippedViewPort.width, mClippedViewPort.height,
+                        mAntiAliasing, true, mSupportHighResolutions);
+                    
+                    if (mSupportHighResolutions && "contentsScaleFactor" in mNativeStage)
+                        mNativeStageContentScaleFactor = mNativeStage["contentsScaleFactor"];
+                    else
+                        mNativeStageContentScaleFactor = 1.0;
                 }
             }
         }
         
+        /** Configures the back buffer while automatically keeping backwards compatibility with
+         *  AIR versions that do not support the "wantsBestResolution" argument. */
+        private function configureBackBuffer(width:int, height:int, antiAlias:int, 
+                                             enableDepthAndStencil:Boolean,
+                                             wantsBestResolution:Boolean=false):void
+        {
+            enableDepthAndStencil &&= SystemUtil.supportsDepthAndStencil;
+            width = (width < 32) ? 32 : width;
+            height = (height < 32) ? 32 : height;
+            var configureBackBuffer:Function = mContext.configureBackBuffer;
+            var methodArgs:Array = [width, height, antiAlias, enableDepthAndStencil];
+            if (configureBackBuffer.length > 4) methodArgs.push(wantsBestResolution);
+            configureBackBuffer.apply(mContext, methodArgs);
+        }
+
         private function updateNativeOverlay():void
         {
-            _nativeOverlay.x = _viewPort.x;
-            _nativeOverlay.y = _viewPort.y;
-            _nativeOverlay.scaleX = _viewPort.width / _stage.stageWidth;
-            _nativeOverlay.scaleY = _viewPort.height / _stage.stageHeight;
+            mNativeOverlay.x = mViewPort.x;
+            mNativeOverlay.y = mViewPort.y;
+            mNativeOverlay.scaleX = mViewPort.width / mStage.stageWidth;
+            mNativeOverlay.scaleY = mViewPort.height / mStage.stageHeight;
         }
         
         /** Stops Starling right away and displays an error message on the native overlay.
@@ -501,7 +611,7 @@ package starling.core
         {
             var background:Shape = new Shape();
             background.graphics.beginFill(0x0, 0.8);
-            background.graphics.drawRect(0, 0, _stage.stageWidth, _stage.stageHeight);
+            background.graphics.drawRect(0, 0, mStage.stageWidth, mStage.stageHeight);
             background.graphics.endFill();
 
             var textField:TextField = new TextField();
@@ -509,11 +619,11 @@ package starling.core
             textFormat.align = TextFormatAlign.CENTER;
             textField.defaultTextFormat = textFormat;
             textField.wordWrap = true;
-            textField.width = _stage.stageWidth * 0.75;
+            textField.width = mStage.stageWidth * 0.75;
             textField.autoSize = TextFieldAutoSize.CENTER;
             textField.text = message;
-            textField.x = (_stage.stageWidth  - textField.width)  / 2;
-            textField.y = (_stage.stageHeight - textField.height) / 2;
+            textField.x = (mStage.stageWidth  - textField.width)  / 2;
+            textField.y = (mStage.stageHeight - textField.height) / 2;
             textField.background = true;
             textField.backgroundColor = 0x550000;
 
@@ -538,8 +648,8 @@ package starling.core
          *  call that method manually.) */
         public function start():void 
         { 
-            _started = _rendering = true;
-            _frameTimestamp = getTimer() / 1000.0;
+            mStarted = mRendering = true;
+            mLastFrameTimestamp = getTimer() / 1000.0;
         }
         
         /** Stops all logic and input processing, effectively freezing the app in its current state.
@@ -553,8 +663,8 @@ package starling.core
          */
         public function stop(suspendRendering:Boolean=false):void
         { 
-            _started = false;
-            _rendering = !suspendRendering;
+            mStarted = false;
+            mRendering = !suspendRendering;
         }
         
         // event handlers
@@ -573,18 +683,16 @@ package starling.core
         
         private function onContextCreated(event:Event):void
         {
-            stage3D.removeEventListener(Event.CONTEXT3D_CREATE, onContextCreated);
-            stage3D.addEventListener(Event.CONTEXT3D_CREATE, onContextRestored, false, 10, true);
-
-            trace("[Starling] Context ready. Display Driver:", context.driverInfo);
-            initialize();
-        }
-
-        private function onContextRestored(event:Event):void
-        {
-            trace("[Starling] Context restored.");
-            updateViewPort(true);
-            dispatchEventWith(Event.CONTEXT3D_CREATE, false, context);
+            if (!Starling.handleLostContext && mContext)
+            {
+                event.stopImmediatePropagation();
+                stopWithFatalError("The application lost the device context!");
+                trace("[Starling] Enable 'Starling.handleLostContext' to avoid this error.");
+            }
+            else
+            {
+                initialize();
+            }
         }
         
         private function onEnterFrame(event:Event):void
@@ -592,10 +700,10 @@ package starling.core
             // On mobile, the native display list is only updated on stage3D draw calls.
             // Thus, we render even when Starling is paused.
             
-            if (!shareContext)
+            if (!mShareContext)
             {
-                if (_started) nextFrame();
-                else if (_rendering) render();
+                if (mStarted) nextFrame();
+                else if (mRendering) render();
             }
 
             updateNativeOverlay();
@@ -603,14 +711,16 @@ package starling.core
         
         private function onKey(event:KeyboardEvent):void
         {
-            if (!_started) return;
+            if (!mStarted) return;
             
             var keyEvent:starling.events.KeyboardEvent = new starling.events.KeyboardEvent(
                 event.type, event.charCode, event.keyCode, event.keyLocation, 
                 event.ctrlKey, event.altKey, event.shiftKey);
             
             makeCurrent();
-            _stage.dispatchEvent(keyEvent);
+
+            if (mBroadcastKeyboardEvents) mStage.broadcastEvent(keyEvent);
+            else mStage.dispatchEvent(keyEvent);
             
             if (keyEvent.isDefaultPrevented())
                 event.preventDefault();
@@ -633,18 +743,18 @@ package starling.core
 
                 makeCurrent();
                 removeEventListener(Event.CONTEXT3D_CREATE, dispatchResizeEvent);
-                _stage.dispatchEvent(new ResizeEvent(Event.RESIZE, stageWidth, stageHeight));
+                mStage.dispatchEvent(new ResizeEvent(Event.RESIZE, stageWidth, stageHeight));
             }
         }
 
         private function onMouseLeave(event:Event):void
         {
-            _touchProcessor.enqueueMouseLeftStage();
+            mTouchProcessor.enqueueMouseLeftStage();
         }
         
         private function onTouch(event:Event):void
         {
-            if (!_started) return;
+            if (!mStarted) return;
             
             var globalX:Number;
             var globalY:Number;
@@ -665,8 +775,8 @@ package starling.core
                 // MouseEvent.buttonDown returns true for both left and right button (AIR supports
                 // the right mouse button). We only want to react on the left button for now,
                 // so we have to save the state for the left button manually.
-                if (event.type == MouseEvent.MOUSE_DOWN)    _leftMouseDown = true;
-                else if (event.type == MouseEvent.MOUSE_UP) _leftMouseDown = false;
+                if (event.type == MouseEvent.MOUSE_DOWN)    mLeftMouseDown = true;
+                else if (event.type == MouseEvent.MOUSE_UP) mLeftMouseDown = false;
             }
             else
             {
@@ -697,19 +807,19 @@ package starling.core
                 case MouseEvent.MOUSE_DOWN:  phase = TouchPhase.BEGAN; break;
                 case MouseEvent.MOUSE_UP:    phase = TouchPhase.ENDED; break;
                 case MouseEvent.MOUSE_MOVE: 
-                    phase = (_leftMouseDown ? TouchPhase.MOVED : TouchPhase.HOVER); break;
+                    phase = (mLeftMouseDown ? TouchPhase.MOVED : TouchPhase.HOVER); break;
             }
             
             // move position into viewport bounds
-            globalX = _stage.stageWidth  * (globalX - _viewPort.x) / _viewPort.width;
-            globalY = _stage.stageHeight * (globalY - _viewPort.y) / _viewPort.height;
+            globalX = mStage.stageWidth  * (globalX - mViewPort.x) / mViewPort.width;
+            globalY = mStage.stageHeight * (globalY - mViewPort.y) / mViewPort.height;
             
             // enqueue touch in touch processor
-            _touchProcessor.enqueue(touchID, phase, globalX, globalY, pressure, width, height);
+            mTouchProcessor.enqueue(touchID, phase, globalX, globalY, pressure, width, height);
             
             // allow objects that depend on mouse-over state to be updated immediately
             if (event.type == MouseEvent.MOUSE_UP && Mouse.supportsCursor)
-                _touchProcessor.enqueue(touchID, TouchPhase.HOVER, globalX, globalY);
+                mTouchProcessor.enqueue(touchID, TouchPhase.HOVER, globalX, globalY);
         }
         
         private function get touchEventTypes():Array
@@ -725,70 +835,148 @@ package starling.core
             return types;
         }
         
+        // program management
+        
+        /** Registers a compiled shader-program under a certain name.
+         *  If the name was already used, the previous program is overwritten. */
+        public function registerProgram(name:String, vertexShader:ByteArray,
+                                        fragmentShader:ByteArray):Program3D
+        {
+            deleteProgram(name);
+            
+            var program:Program3D = mContext.createProgram();
+            program.upload(vertexShader, fragmentShader);
+            programs[name] = program;
+            
+            return program;
+        }
+        
+        /** Compiles a shader-program and registers it under a certain name.
+         *  If the name was already used, the previous program is overwritten. */
+        public function registerProgramFromSource(name:String, vertexShader:String,
+                                                  fragmentShader:String):Program3D
+        {
+            deleteProgram(name);
+            
+            var program:Program3D = RenderSupport.assembleAgal(vertexShader, fragmentShader);
+            programs[name] = program;
+            
+            return program;
+        }
+        
+        /** Deletes the vertex- and fragment-programs of a certain name. */
+        public function deleteProgram(name:String):void
+        {
+            var program:Program3D = getProgram(name);            
+            if (program)
+            {                
+                program.dispose();
+                delete programs[name];
+            }
+        }
+        
+        /** Returns the vertex- and fragment-programs registered under a certain name. */
+        public function getProgram(name:String):Program3D
+        {
+            return programs[name] as Program3D;
+        }
+        
+        /** Indicates if a set of vertex- and fragment-programs is registered under a certain name. */
+        public function hasProgram(name:String):Boolean
+        {
+            return name in programs;
+        }
+        
+        private function get programs():Dictionary { return contextData[PROGRAM_DATA_NAME]; }
+        
         // properties
         
         /** Indicates if this Starling instance is started. */
-        public function get isStarted():Boolean { return _started; }
+        public function get isStarted():Boolean { return mStarted; }
         
         /** The default juggler of this instance. Will be advanced once per frame. */
-        public function get juggler():Juggler { return _juggler; }
-
-        /** The painter, which is used for all rendering. The same instance is passed to all
-         *  <code>render</code>methods each frame.
-         *
-         *  <p>Note that the painter is shared among all Starling instances that use the same
-         *  Stage3D object for rendering. That way, the instances can share context-related data,
-         *  e.g. textures, programs or the current context settings.</p> */
-        public function get painter():Painter { return _painter; }
+        public function get juggler():Juggler { return mJuggler; }
         
         /** The render context of this instance. */
-        public function get context():Context3D { return _painter.context; }
+        public function get context():Context3D { return mContext; }
+        
+        /** A dictionary that can be used to save custom data related to the current context. 
+         *  If you need to share data that is bound to a specific stage3D instance
+         *  (e.g. textures), use this dictionary instead of creating a static class variable.
+         *  The Dictionary is actually bound to the stage3D instance, thus it survives a 
+         *  context loss. */
+        public function get contextData():Dictionary
+        {
+            return sContextData[mStage3D] as Dictionary;
+        }
+        
+        /** Returns the current width of the back buffer. In most cases, this value is in pixels;
+         *  however, if the app is running on an HiDPI display with an activated
+         *  'supportHighResolutions' setting, you have to multiply with 'backBufferPixelsPerPoint'
+         *  for the actual pixel count. */
+        public function get backBufferWidth():int { return mClippedViewPort.width; }
+
+        /** Returns the current height of the back buffer. In most cases, this value is in pixels;
+         *  however, if the app is running on an HiDPI display with an activated
+         *  'supportHighResolutions' setting, you have to multiply with 'backBufferPixelsPerPoint'
+         *  for the actual pixel count.  */
+        public function get backBufferHeight():int { return mClippedViewPort.height; }
+
+        /** The number of pixel per point returned by the 'backBufferWidth/Height' properties.
+         *  Except for desktop HiDPI displays with an activated 'supportHighResolutions' setting,
+         *  this will always return '1'. */
+        public function get backBufferPixelsPerPoint():int
+        {
+            return mNativeStageContentScaleFactor;
+        }
 
         /** Indicates if multitouch simulation with "Shift" and "Ctrl"/"Cmd"-keys is enabled.
          *  @default false */
-        public function get simulateMultitouch():Boolean { return _touchProcessor.simulateMultitouch; }
+        public function get simulateMultitouch():Boolean { return mSimulateMultitouch; }
         public function set simulateMultitouch(value:Boolean):void
         {
-            _touchProcessor.simulateMultitouch = value;
+            mSimulateMultitouch = value;
+            if (mContext) mTouchProcessor.simulateMultitouch = value;
         }
-        
+
         /** Indicates if Stage3D render methods will report errors. It's recommended to activate
          *  this when writing custom rendering code (shaders, etc.), since you'll get more detailed
          *  error messages. However, it has a very negative impact on performance, and it prevents
          *  ATF textures from being restored on a context loss. Never activate for release builds!
          *
          *  @default false */
-        public function get enableErrorChecking():Boolean { return _painter.enableErrorChecking; }
-        public function set enableErrorChecking(value:Boolean):void
-        {
-            _painter.enableErrorChecking = value;
+        public function get enableErrorChecking():Boolean { return mEnableErrorChecking; }
+        public function set enableErrorChecking(value:Boolean):void 
+        { 
+            mEnableErrorChecking = value;
+            if (mContext) mContext.enableErrorChecking = value; 
         }
-
-        /** The anti-aliasing level. 0 - none, 16 - maximum. @default 0 */
-        public function get antiAliasing():int { return _antiAliasing; }
+        
+        /** The antialiasing level. 0 - no antialasing, 16 - maximum antialiasing. @default 0 */
+        public function get antiAliasing():int { return mAntiAliasing; }
         public function set antiAliasing(value:int):void
         {
-            if (_antiAliasing != value)
+            if (mAntiAliasing != value)
             {
-                _antiAliasing = value;
+                mAntiAliasing = value;
                 if (contextValid) updateViewPort(true);
             }
         }
         
         /** The viewport into which Starling contents will be rendered. */
-        public function get viewPort():Rectangle { return _viewPort; }
-        public function set viewPort(value:Rectangle):void { _viewPort = value.clone(); }
+        public function get viewPort():Rectangle { return mViewPort; }
+        public function set viewPort(value:Rectangle):void { mViewPort = value.clone(); }
         
         /** The ratio between viewPort width and stage width. Useful for choosing a different
          *  set of textures depending on the display resolution. */
         public function get contentScaleFactor():Number
         {
-            return (_viewPort.width * _painter.backBufferScaleFactor) / _stage.stageWidth;
+            return (mViewPort.width * mNativeStageContentScaleFactor) / mStage.stageWidth;
         }
         
         /** A Flash Sprite placed directly on top of the Starling content. Use it to display native
          *  Flash components. */ 
-        public function get nativeOverlay():Sprite { return _nativeOverlay; }
+        public function get nativeOverlay():Sprite { return mNativeOverlay; }
         
         /** Indicates if a small statistics box (with FPS, memory usage and draw count) is
          *  displayed.
@@ -798,72 +986,69 @@ package starling.core
          *  into account. It is recommended to use Adobe Scout for reliable and comprehensive
          *  memory analysis.</p>
          */
-        public function get showStats():Boolean { return _statsDisplay && _statsDisplay.parent; }
+        public function get showStats():Boolean { return mStatsDisplay && mStatsDisplay.parent; }
         public function set showStats(value:Boolean):void
         {
             if (value == showStats) return;
             
             if (value)
             {
-                if (_statsDisplay) _stage.addChild(_statsDisplay);
+                if (mStatsDisplay) mStage.addChild(mStatsDisplay);
                 else               showStatsAt();
             }
-            else _statsDisplay.removeFromParent();
+            else mStatsDisplay.removeFromParent();
         }
         
         /** Displays the statistics box at a certain position. */
-        public function showStatsAt(horizontalAlign:String="left",
-                                    verticalAlign:String="top", scale:Number=1):void
+        public function showStatsAt(hAlign:String="left", vAlign:String="top", scale:Number=1):void
         {
-            if (context == null)
+            if (mContext == null)
             {
                 // Starling is not yet ready - we postpone this until it's initialized.
                 addEventListener(starling.events.Event.ROOT_CREATED, onRootCreated);
             }
             else
             {
-                var stageWidth:int  = _stage.stageWidth;
-                var stageHeight:int = _stage.stageHeight;
+                var stageWidth:int  = mStage.stageWidth;
+                var stageHeight:int = mStage.stageHeight;
 
-                if (_statsDisplay == null)
+                if (mStatsDisplay == null)
                 {
-                    _statsDisplay = new StatsDisplay();
-                    _statsDisplay.touchable = false;
+                    mStatsDisplay = new StatsDisplay();
+                    mStatsDisplay.touchable = false;
                 }
 
-                _stage.addChild(_statsDisplay);
-                _statsDisplay.scaleX = _statsDisplay.scaleY = scale;
+                mStage.addChild(mStatsDisplay);
+                mStatsDisplay.scaleX = mStatsDisplay.scaleY = scale;
 
-                if (horizontalAlign == Align.LEFT) _statsDisplay.x = 0;
-                else if (horizontalAlign == Align.RIGHT)  _statsDisplay.x =  stageWidth - _statsDisplay.width;
-                else if (horizontalAlign == Align.CENTER) _statsDisplay.x = (stageWidth - _statsDisplay.width) / 2;
-                else throw new ArgumentError("Invalid horizontal alignment: " + horizontalAlign);
+                if (hAlign == HAlign.LEFT) mStatsDisplay.x = 0;
+                else if (hAlign == HAlign.RIGHT) mStatsDisplay.x = stageWidth - mStatsDisplay.width; 
+                else mStatsDisplay.x = int((stageWidth - mStatsDisplay.width) / 2);
                 
-                if (verticalAlign == Align.TOP) _statsDisplay.y = 0;
-                else if (verticalAlign == Align.BOTTOM) _statsDisplay.y =  stageHeight - _statsDisplay.height;
-                else if (verticalAlign == Align.CENTER) _statsDisplay.y = (stageHeight - _statsDisplay.height) / 2;
-                else throw new ArgumentError("Invalid vertical alignment: " + verticalAlign);
+                if (vAlign == VAlign.TOP) mStatsDisplay.y = 0;
+                else if (vAlign == VAlign.BOTTOM) mStatsDisplay.y = stageHeight - mStatsDisplay.height;
+                else mStatsDisplay.y = int((stageHeight - mStatsDisplay.height) / 2);
             }
             
             function onRootCreated():void
             {
-                showStatsAt(horizontalAlign, verticalAlign, scale);
+                showStatsAt(hAlign, vAlign, scale);
                 removeEventListener(starling.events.Event.ROOT_CREATED, onRootCreated);
             }
         }
         
         /** The Starling stage object, which is the root of the display tree that is rendered. */
-        public function get stage():Stage { return _stage; }
+        public function get stage():Stage { return mStage; }
 
         /** The Flash Stage3D object Starling renders into. */
-        public function get stage3D():Stage3D { return _painter.stage3D; }
+        public function get stage3D():Stage3D { return mStage3D; }
         
         /** The Flash (2D) stage object Starling renders beneath. */
-        public function get nativeStage():flash.display.Stage { return _nativeStage; }
+        public function get nativeStage():flash.display.Stage { return mNativeStage; }
         
         /** The instance of the root class provided in the constructor. Available as soon as 
          *  the event 'ROOT_CREATED' has been dispatched. */
-        public function get root():DisplayObject { return _root; }
+        public function get root():DisplayObject { return mRoot; }
 
         /** The class that will be instantiated by Starling as the 'root' display object.
          *  Must be a subclass of 'starling.display.DisplayObject'.
@@ -875,62 +1060,75 @@ package starling.core
          *  <p>Beware: you cannot change the root class once the root object has been
          *  instantiated.</p>
          */
-        public function get rootClass():Class { return _rootClass; }
+        public function get rootClass():Class { return mRootClass; }
         public function set rootClass(value:Class):void
         {
-            if (_rootClass != null && _root != null)
+            if (mRootClass != null && mRoot != null)
                 throw new Error("Root class may not change after root has been instantiated");
-            else if (_rootClass == null)
+            else if (mRootClass == null)
             {
-                _rootClass = value;
-                if (context) initializeRoot();
+                mRootClass = value;
+                if (mContext) initializeRoot();
             }
         }
 
-        /** Indicates if another Starling instance (or another Stage3D framework altogether)
-         *  uses the same render context. If enabled, Starling will not execute any destructive
-         *  context operations (e.g. not call 'configureBackBuffer', 'clear', 'present', etc.
-         *  This has to be done manually, then. @default false */
-        public function get shareContext() : Boolean { return _painter.shareContext; }
-        public function set shareContext(value : Boolean) : void { _painter.shareContext = value; }
-
-        /** The Context3D profile of the current render context, or <code>null</code>
-         *  if the context has not been created yet. */
-        public function get profile():String { return _painter.profile; }
-
+        /** Indicates if the Context3D render calls are managed externally to Starling, 
+         *  to allow other frameworks to share the Stage3D instance. @default false */
+        public function get shareContext() : Boolean { return mShareContext; }
+        public function set shareContext(value : Boolean) : void { mShareContext = value; }
+        
+        /** The Context3D profile used for rendering. Beware that if you are using a shared
+         *  context in AIR 3.9 / Flash Player 11 or below, this is simply what you passed to
+         *  the Starling constructor. */
+        public function get profile():String { return mProfile; }
+        
         /** Indicates that if the device supports HiDPI screens Starling will attempt to allocate
          *  a larger back buffer than indicated via the viewPort size. Note that this is used
          *  on Desktop only; mobile AIR apps still use the "requestedDisplayResolution" parameter
          *  the application descriptor XML. @default false */
-        public function get supportHighResolutions():Boolean { return _supportHighResolutions; }
+        public function get supportHighResolutions():Boolean { return mSupportHighResolutions; }
         public function set supportHighResolutions(value:Boolean):void 
         {
-            if (_supportHighResolutions != value)
+            if (mSupportHighResolutions != value)
             {
-                _supportHighResolutions = value;
+                mSupportHighResolutions = value;
                 if (contextValid) updateViewPort(true);
             }
+        }
+
+        /** Indicates if keyboard events are broadcast to all display objects, or dispatched
+         *  to the stage only. In some situations, it makes sense to deactivate this setting
+         *  for performance reasons. @default true */
+        public function get broadcastKeyboardEvents():Boolean { return mBroadcastKeyboardEvents; }
+        public function set broadcastKeyboardEvents(value:Boolean):void
+        {
+            mBroadcastKeyboardEvents = value;
         }
         
         /** The TouchProcessor is passed all mouse and touch input and is responsible for
          *  dispatching TouchEvents to the Starling display tree. If you want to handle these
          *  types of input manually, pass your own custom subclass to this property. */
-        public function get touchProcessor():TouchProcessor { return _touchProcessor; }
+        public function get touchProcessor():TouchProcessor { return mTouchProcessor; }
         public function set touchProcessor(value:TouchProcessor):void
         {
-            if (value != _touchProcessor)
+            if (value != mTouchProcessor)
             {
-                _touchProcessor.dispose();
-                _touchProcessor = value;
+                mTouchProcessor.dispose();
+                mTouchProcessor = value;
             }
         }
-
-        /** The number of frames that have been rendered since this instance was created. */
-        public function get frameID():uint { return _frameID; }
         
         /** Indicates if the Context3D object is currently valid (i.e. it hasn't been lost or
          *  disposed). */
-        public function get contextValid():Boolean { return _painter.contextValid; }
+        public function get contextValid():Boolean
+        {
+            if (mContext)
+            {
+                const driverInfo:String = mContext.driverInfo;
+                return driverInfo != null && driverInfo != "" && driverInfo != "Disposed";
+            }
+            else return false;
+        }
 
         // static properties
         
@@ -944,10 +1142,7 @@ package starling.core
         public static function get context():Context3D { return sCurrent ? sCurrent.context : null; }
         
         /** The default juggler of the currently active Starling instance. */
-        public static function get juggler():Juggler { return sCurrent ? sCurrent._juggler : null; }
-
-        /** The painter used for all rendering of the currently active Starling instance. */
-        public static function get painter():Painter { return sCurrent ? sCurrent._painter : null; }
+        public static function get juggler():Juggler { return sCurrent ? sCurrent.juggler : null; }
         
         /** The contentScaleFactor of the currently active Starling instance. */
         public static function get contentScaleFactor():Number 
@@ -969,11 +1164,35 @@ package starling.core
                 Multitouch.inputMode = value ? MultitouchInputMode.TOUCH_POINT :
                                                MultitouchInputMode.NONE;
         }
-
-        /** The number of frames that have been rendered since the current instance was created. */
-        public static function get frameID():uint
+        
+        /** Indicates if Starling should automatically recover from a lost device context.
+         *  On some systems, an upcoming screensaver or entering sleep mode may 
+         *  invalidate the render context. This setting indicates if Starling should recover from 
+         *  such incidents.
+         *
+         *  <p>Beware: if used carelessly, this property may have a huge impact on memory
+         *  consumption. That's because, by default, it will make Starling keep a copy of each
+         *  texture in memory.</p>
+         *
+         *  <p>However, this downside can be avoided by using the "AssetManager" to load textures.
+         *  The AssetManager is smart enough to restore them directly from their sources. You can
+         *  also do this by setting up "root.onRestore" on your manually loaded textures.</p>
+         *
+         *  <p>A context loss can happen on almost every platform. It's very common on Windows
+         *  and Android, but rare on OS X and iOS (e.g. it may occur when opening up the camera
+         *  roll). It's recommended to always enable this property, while using the AssetManager
+         *  for texture loading.</p>
+         *  
+         *  @default true
+         *  @see starling.utils.AssetManager
+         */
+        public static function get handleLostContext():Boolean { return sHandleLostContext; }
+        public static function set handleLostContext(value:Boolean):void 
         {
-            return sCurrent ? sCurrent._frameID : 0;
+            if (sCurrent) throw new IllegalOperationError(
+                "'handleLostContext' must be set before Starling instance is created");
+            else
+                sHandleLostContext = value;
         }
     }
 }
